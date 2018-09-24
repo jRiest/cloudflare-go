@@ -1,12 +1,18 @@
 package cloudflare
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"regexp"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -118,7 +124,31 @@ var (
 	successResponse               = Response{Success: true, Errors: []ResponseInfo{}, Messages: []ResponseInfo{}}
 	workerScript                  = "addEventListener('fetch', event => {\n    event.passThroughOnException()\nevent.respondWith(handleRequest(event.request))\n})\n\nasync function handleRequest(request) {\n    return fetch(request)\n}"
 	deleteWorkerRouteResponseData = createWorkerRouteResponse
+	formDataContentTypeRegex      = regexp.MustCompile("^multipart/form-data; boundary=")
 )
+
+func getFormValue(form *multipart.Form, key string) ([]byte, error) {
+	// In Go 1.10 there was a bug where field values with a content-type
+	// but without a filename would end up in Form.File but in versions
+	// before and after 1.10 they would be in form.Value. Here we check
+	// both in order to handle both scenarios
+	// https://golang.org/doc/go1.11#mime/multipart
+	values, ok := form.Value[key]
+	if ok {
+		return []byte(values[0]), nil
+	}
+
+	fileHeaders, ok := form.File[key]
+	if ok {
+		file, err := fileHeaders[0].Open()
+		if err != nil {
+			return make([]byte, 0), err
+		}
+		return ioutil.ReadAll(file)
+	}
+
+	return make([]byte, 0), fmt.Errorf("no value found for key %v", key)
+}
 
 func TestWorkers_DeleteWorker(t *testing.T) {
 	setup()
@@ -241,7 +271,6 @@ func TestWorkers_ListWorkerScripts(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res.WorkerList)
 	}
-
 }
 
 func TestWorkers_UploadWorker(t *testing.T) {
@@ -252,7 +281,7 @@ func TestWorkers_UploadWorker(t *testing.T) {
 		assert.Equal(t, "PUT", r.Method, "Expected method 'PUT', got %s", r.Method)
 		contentTypeHeader := r.Header.Get("content-type")
 		assert.Equal(t, "application/javascript", contentTypeHeader, "Expected content-type request header to be 'application/javascript', got %s", contentTypeHeader)
-		w.Header().Set("content-type", "application/javascript")
+		w.Header().Set("content-type", "application/json")
 		fmt.Fprintf(w, uploadWorkerResponseData)
 	})
 	res, err := client.UploadWorker(&WorkerRequestParams{ZoneID: "foo"}, workerScript)
@@ -270,7 +299,6 @@ func TestWorkers_UploadWorker(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_UploadWorkerWithName(t *testing.T) {
@@ -281,7 +309,7 @@ func TestWorkers_UploadWorkerWithName(t *testing.T) {
 		assert.Equal(t, "PUT", r.Method, "Expected method 'PUT', got %s", r.Method)
 		contentTypeHeader := r.Header.Get("content-type")
 		assert.Equal(t, "application/javascript", contentTypeHeader, "Expected content-type request header to be 'application/javascript', got %s", contentTypeHeader)
-		w.Header().Set("content-type", "application/javascript")
+		w.Header().Set("content-type", "application/json")
 		fmt.Fprintf(w, uploadWorkerResponseData)
 	})
 	res, err := client.UploadWorker(&WorkerRequestParams{ScriptName: "bar"}, workerScript)
@@ -309,7 +337,7 @@ func TestWorkers_UploadWorkerSingleScriptWithOrg(t *testing.T) {
 		assert.Equal(t, "PUT", r.Method, "Expected method 'PUT', got %s", r.Method)
 		contentTypeHeader := r.Header.Get("content-type")
 		assert.Equal(t, "application/javascript", contentTypeHeader, "Expected content-type request header to be 'application/javascript', got %s", contentTypeHeader)
-		w.Header().Set("content-type", "application/javascript")
+		w.Header().Set("content-type", "application/json")
 		fmt.Fprintf(w, uploadWorkerResponseData)
 	})
 	res, err := client.UploadWorker(&WorkerRequestParams{ZoneID: "foo"}, workerScript)
@@ -337,6 +365,87 @@ func TestWorkers_UploadWorkerWithNameErrorsWithoutOrgId(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestWorkers_UploadWorkerWithInheritBinding(t *testing.T) {
+	setup(UsingOrganization("foo"))
+	defer teardown()
+
+	// Setup route handler for both single-script and multi-script
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "PUT", r.Method, "Expected method 'PUT', got %s", r.Method)
+		contentTypeHeader := r.Header.Get("content-type")
+		require.Regexp(t, formDataContentTypeRegex, contentTypeHeader, "Expected valid multipart/form-data content-type, got %s", contentTypeHeader)
+
+		_, params, err := mime.ParseMediaType(contentTypeHeader)
+		require.NoError(t, err)
+		boundary := params["boundary"]
+		mpr := multipart.NewReader(r.Body, boundary)
+		form, err := mpr.ReadForm(1024 * 1024)
+		require.Nil(t, err)
+
+		// unpack the metadata into a struct
+		type inheritBinding struct {
+			OldName string `json:"old_name"`
+		}
+		type metadata struct {
+			BodyPart string           `json:"body_part"`
+			Bindings []inheritBinding `json:"bindings"`
+		}
+		metaBytes, err := getFormValue(form, "metadata")
+		require.NoError(t, err)
+
+		var md metadata
+		require.NoError(t, json.Unmarshal(metaBytes, &md))
+		require.Equal(t, md, metadata{
+			BodyPart: "script",
+			Bindings: []inheritBinding{
+				inheritBinding{},
+				inheritBinding{OldName: "old_binding_name"},
+			},
+		})
+
+		w.Header().Set("content-type", "application/json")
+		fmt.Fprintf(w, uploadWorkerResponseData)
+	}
+	mux.HandleFunc("/zones/foo/workers/script", handler)
+	mux.HandleFunc("/accounts/foo/workers/scripts/bar", handler)
+
+	// Setup WorkerScriptParams
+	bindings := make(map[string]WorkerBinding, 2)
+	bindings["b1"] = WorkerInheritBinding{}
+	bindings["b2"] = WorkerInheritBinding{
+		OldName: "old_binding_name",
+	}
+	scriptParams := WorkerScriptParams{
+		Script:   workerScript,
+		Bindings: bindings,
+	}
+
+	// Expected response
+	formattedTime, _ := time.Parse(time.RFC3339Nano, "2018-06-09T15:17:01.989141Z")
+	want := WorkerScriptResponse{
+		successResponse,
+		WorkerScript{
+			Script: workerScript,
+			WorkerMetaData: WorkerMetaData{
+				ETAG:       "279cf40d86d70b82f6cd3ba90a646b3ad995912da446836d7371c21c6a43977a",
+				Size:       191,
+				ModifiedOn: formattedTime,
+			},
+		}}
+
+	// Test single-script
+	res, err := client.UploadWorkerWithBindings(&WorkerRequestParams{ZoneID: "foo"}, scriptParams)
+	if assert.NoError(t, err) {
+		assert.Equal(t, want, res)
+	}
+
+	// Test multi-script
+	res, err = client.UploadWorkerWithBindings(&WorkerRequestParams{ScriptName: "bar"}, scriptParams)
+	if assert.NoError(t, err) {
+		assert.Equal(t, want, res)
+	}
+}
+
 func TestWorkers_CreateWorkerRoute(t *testing.T) {
 	setup()
 	defer teardown()
@@ -352,7 +461,6 @@ func TestWorkers_CreateWorkerRoute(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_CreateWorkerRouteEnt(t *testing.T) {
@@ -370,7 +478,6 @@ func TestWorkers_CreateWorkerRouteEnt(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_CreateWorkerRouteSingleScriptWithOrg(t *testing.T) {
@@ -388,7 +495,6 @@ func TestWorkers_CreateWorkerRouteSingleScriptWithOrg(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_DeleteWorkerRoute(t *testing.T) {
@@ -408,7 +514,6 @@ func TestWorkers_DeleteWorkerRoute(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_DeleteWorkerRouteEnt(t *testing.T) {
@@ -428,7 +533,6 @@ func TestWorkers_DeleteWorkerRouteEnt(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_ListWorkerRoutes(t *testing.T) {
@@ -496,7 +600,6 @@ func TestWorkers_UpdateWorkerRoute(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_UpdateWorkerRouteEnt(t *testing.T) {
@@ -519,7 +622,6 @@ func TestWorkers_UpdateWorkerRouteEnt(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }
 
 func TestWorkers_UpdateWorkerRouteSingleScriptWithOrg(t *testing.T) {
@@ -542,5 +644,4 @@ func TestWorkers_UpdateWorkerRouteSingleScriptWithOrg(t *testing.T) {
 	if assert.NoError(t, err) {
 		assert.Equal(t, want, res)
 	}
-
 }

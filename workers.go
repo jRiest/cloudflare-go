@@ -1,8 +1,12 @@
 package cloudflare
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"time"
 
 	"github.com/pkg/errors"
@@ -12,6 +16,18 @@ import (
 type WorkerRequestParams struct {
 	ZoneID     string
 	ScriptName string
+}
+
+type bindingBodyWriter func(*multipart.Writer) error
+
+type WorkerBinding interface {
+	serialize(string) (json.RawMessage, bindingBodyWriter, error)
+}
+
+// WorkerScriptParams provides a worker script and the associated bindings
+type WorkerScriptParams struct {
+	Script   string
+	Bindings map[string]WorkerBinding
 }
 
 // WorkerRoute aka filters are patterns used to enable or disable workers that match requests.
@@ -61,6 +77,31 @@ type WorkerListResponse struct {
 type WorkerScriptResponse struct {
 	Response
 	WorkerScript `json:"result"`
+}
+
+// Bindings
+
+type WorkerInheritBinding struct {
+	OldName string
+}
+
+func (b WorkerInheritBinding) serialize(name string) (json.RawMessage, bindingBodyWriter, error) {
+	type meta struct {
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		OldName string `json:"old_name,omitempty"`
+	}
+
+	metadata, err := json.Marshal(meta{
+		Name:    name,
+		Type:    "inherit",
+		OldName: b.OldName,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return metadata, nil, nil
 }
 
 // DeleteWorker deletes worker for a zone.
@@ -169,12 +210,30 @@ func (api *API) ListWorkerScripts() (WorkerListResponse, error) {
 // API reference: https://api.cloudflare.com/#worker-script-upload-worker
 func (api *API) UploadWorker(requestParams *WorkerRequestParams, data string) (WorkerScriptResponse, error) {
 	if requestParams.ScriptName != "" {
-		return api.uploadWorkerWithName(requestParams.ScriptName, data)
+		return api.multiScriptUpload(requestParams.ScriptName, "application/javascript", []byte(data))
 	}
-	uri := "/zones/" + requestParams.ZoneID + "/workers/script"
+	return api.singleScriptUpload(requestParams.ZoneID, "application/javascript", []byte(data))
+}
+
+// UploadWorkerWithBindings push raw script content and bindings for your worker
+//
+// API reference: https://api.cloudflare.com/#worker-script-upload-worker
+func (api *API) UploadWorkerWithBindings(requestParams *WorkerRequestParams, data WorkerScriptParams) (WorkerScriptResponse, error) {
+	contentType, body, err := formatMultipartBody(data)
+	if err != nil {
+		return WorkerScriptResponse{}, err
+	}
+	if requestParams.ScriptName != "" {
+		return api.multiScriptUpload(requestParams.ScriptName, contentType, body)
+	}
+	return api.singleScriptUpload(requestParams.ZoneID, contentType, body)
+}
+
+func (api *API) singleScriptUpload(zoneId, contentType string, body []byte) (WorkerScriptResponse, error) {
+	uri := "/zones/" + zoneId + "/workers/script"
 	headers := make(http.Header)
-	headers.Set("Content-Type", "application/javascript")
-	res, err := api.makeRequestWithHeaders("PUT", uri, []byte(data), headers)
+	headers.Set("Content-Type", contentType)
+	res, err := api.makeRequestWithHeaders("PUT", uri, body, headers)
 	var r WorkerScriptResponse
 	if err != nil {
 		return r, errors.Wrap(err, errMakeRequestError)
@@ -186,18 +245,14 @@ func (api *API) UploadWorker(requestParams *WorkerRequestParams, data string) (W
 	return r, nil
 }
 
-// UploadWorkerWithName push raw script content for your worker
-// This is an enterprise only feature https://developers.cloudflare.com/workers/api/config-api-for-enterprise/
-//
-// API reference: https://api.cloudflare.com/#worker-script-upload-worker
-func (api *API) uploadWorkerWithName(scriptName string, data string) (WorkerScriptResponse, error) {
+func (api *API) multiScriptUpload(scriptName, contentType string, body []byte) (WorkerScriptResponse, error) {
 	if api.OrganizationID == "" {
 		return WorkerScriptResponse{}, errors.New("organization ID required for enterprise only request")
 	}
 	uri := "/accounts/" + api.OrganizationID + "/workers/scripts/" + scriptName
 	headers := make(http.Header)
-	headers.Set("Content-Type", "application/javascript")
-	res, err := api.makeRequestWithHeaders("PUT", uri, []byte(data), headers)
+	headers.Set("Content-Type", contentType)
+	res, err := api.makeRequestWithHeaders("PUT", uri, body, headers)
 	var r WorkerScriptResponse
 	if err != nil {
 		return r, errors.Wrap(err, errMakeRequestError)
@@ -207,6 +262,73 @@ func (api *API) uploadWorkerWithName(scriptName string, data string) (WorkerScri
 		return r, errors.Wrap(err, errUnmarshalError)
 	}
 	return r, nil
+}
+
+func hasKey(m map[string]WorkerBinding, key string) bool {
+	_, hasKey := m[key]
+	return hasKey
+}
+
+// Returns content-type, body, error
+func formatMultipartBody(params WorkerScriptParams) (string, []byte, error) {
+	var buf = &bytes.Buffer{}
+	var mpw = multipart.NewWriter(buf)
+	defer mpw.Close()
+
+	// Make sure that the script body part doesn't collide with any binding body parts
+	scriptBodyPart := "script"
+	for hasKey(params.Bindings, scriptBodyPart) {
+		scriptBodyPart = scriptBodyPart + "_"
+	}
+
+	type metadata struct {
+		BodyPart string            `json:"body_part"`
+		Bindings []json.RawMessage `json:"bindings"`
+	}
+	meta := metadata{
+		BodyPart: scriptBodyPart,
+		Bindings: make([]json.RawMessage, 0, len(params.Bindings)),
+	}
+
+	bodyWriters := make([]bindingBodyWriter, 0, len(params.Bindings))
+	for name, b := range params.Bindings {
+		bindingMeta, bodyWriter, err := b.serialize(name)
+		if err != nil {
+			return "", nil, err
+		}
+
+		meta.Bindings = append(meta.Bindings, bindingMeta)
+		bodyWriters = append(bodyWriters, bodyWriter)
+	}
+
+	var hdr = textproto.MIMEHeader{}
+	hdr.Set("content-disposition", fmt.Sprintf(`form-data; name="%s"`, "metadata"))
+	hdr.Set("content-type", "application/json")
+	pw, err := mpw.CreatePart(hdr)
+	if err != nil {
+		return "", nil, err
+	}
+	metaJson, err := json.Marshal(meta)
+	if err != nil {
+		return "", nil, err
+	}
+	_, err = pw.Write(metaJson)
+	if err != nil {
+		return "", nil, err
+	}
+
+	for _, w := range bodyWriters {
+		if w != nil {
+			err = w(mpw)
+			if err != nil {
+				return "", nil, err
+			}
+		}
+	}
+
+	mpw.Close()
+
+	return mpw.FormDataContentType(), buf.Bytes(), nil
 }
 
 // CreateWorkerRoute creates worker route for a zone
