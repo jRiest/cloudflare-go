@@ -380,28 +380,35 @@ func TestWorkers_UploadWorkerWithInheritBinding(t *testing.T) {
 		boundary := params["boundary"]
 		mpr := multipart.NewReader(r.Body, boundary)
 		form, err := mpr.ReadForm(1024 * 1024)
-		require.Nil(t, err)
+		require.NoError(t, err)
 
-		// unpack the metadata into a struct
+		// validate the metadata
 		type inheritBinding struct {
+			Name    string `json:"name"`
+			Type    string `json:"type"`
 			OldName string `json:"old_name"`
 		}
 		type metadata struct {
 			BodyPart string           `json:"body_part"`
 			Bindings []inheritBinding `json:"bindings"`
 		}
-		metaBytes, err := getFormValue(form, "metadata")
+		mdBytes, err := getFormValue(form, "metadata")
 		require.NoError(t, err)
 
 		var md metadata
-		require.NoError(t, json.Unmarshal(metaBytes, &md))
-		require.Equal(t, md, metadata{
+		require.NoError(t, json.Unmarshal(mdBytes, &md))
+		require.Equal(t, metadata{
 			BodyPart: "script",
 			Bindings: []inheritBinding{
 				inheritBinding{},
 				inheritBinding{OldName: "old_binding_name"},
 			},
-		})
+		}, md)
+
+		// validate the script
+		script, err := getFormValue(form, "script")
+		require.NoError(t, err)
+		require.Equal(t, workerScript, string(script))
 
 		w.Header().Set("content-type", "application/json")
 		fmt.Fprintf(w, uploadWorkerResponseData)

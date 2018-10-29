@@ -275,15 +275,16 @@ func formatMultipartBody(params WorkerScriptParams) (string, []byte, error) {
 	var mpw = multipart.NewWriter(buf)
 	defer mpw.Close()
 
-	// Make sure that the script body part doesn't collide with any binding body parts
-	scriptBodyPart := "script"
-	for hasKey(params.Bindings, scriptBodyPart) {
-		scriptBodyPart = scriptBodyPart + "_"
-	}
-
+	// Write metadata part
 	type metadata struct {
 		BodyPart string            `json:"body_part"`
 		Bindings []json.RawMessage `json:"bindings"`
+	}
+
+	scriptBodyPart := "script"
+	for hasKey(params.Bindings, scriptBodyPart) {
+		// Make sure that the script body part doesn't collide with any binding body parts
+		scriptBodyPart = scriptBodyPart + "_"
 	}
 	meta := metadata{
 		BodyPart: scriptBodyPart,
@@ -317,6 +318,17 @@ func formatMultipartBody(params WorkerScriptParams) (string, []byte, error) {
 		return "", nil, err
 	}
 
+	// Write script part
+	hdr = textproto.MIMEHeader{}
+	hdr.Set("content-disposition", fmt.Sprintf(`form-data; name="%s"`, scriptBodyPart))
+	hdr.Set("content-type", "application/javascript")
+	pw, err = mpw.CreatePart(hdr)
+	_, err = pw.Write([]byte(params.Script))
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Write other bindings with parts
 	for _, w := range bodyWriters {
 		if w != nil {
 			err = w(mpw)
